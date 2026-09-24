@@ -1,0 +1,552 @@
+## 2. RTOS Basic Concepts
+
+### Tasks/Threads — Deeper Theory
+
+**What a task actually is, at the lowest level**
+
+A **task** (also called a thread in some RTOS terminology) is the fundamental unit of independent, schedulable execution in an RTOS. Conceptually, it's simple: a task is just a **function that runs, conceptually, "forever" or until it completes, as if it had the CPU entirely to itself** — with the RTOS creating the illusion that many such functions are running simultaneously, even on a single CPU core.
+
+```c
+void Task_SensorRead(void *pvParameters) {
+    while(1) {
+        read_sensor();
+        vTaskDelay(pdMS_TO_TICKS(100));  // sleep, let other tasks run
+    }
+}
+```
+
+But the theoretical depth here isn't in the syntax — it's in **what makes this illusion possible, and where it breaks down.**
+
+---
+
+**The core mechanism: each task believes it owns the CPU**
+
+Every task is written as if it's the only thing running on the processor. It doesn't need to know about other tasks, doesn't need to manually "yield" control in a hand-crafted way (unlike cooperative multitasking), and doesn't need to interleave its logic with anyone else's. This illusion is maintained by the RTOS through **time-slicing and context switching** — the RTOS rapidly switches which task's context is loaded into the CPU registers, fast enough that from a human/system perspective, it looks like simultaneous execution.
+
+**Key theoretical point:** On a **single-core CPU**, true parallelism between tasks is *impossible* — at any given instant, exactly one task is physically executing on the CPU. What looks like "multitasking" is really **very fast sequential execution with context switching in between**. This is called **concurrency**, not **parallelism** — a distinction that matters a lot:
+- **Concurrency** = multiple tasks *make progress* over a period of time, but not necessarily at the exact same instant.
+- **Parallelism** = multiple tasks execute at the *exact same instant*, which requires multiple physical CPU cores.
+
+Most classic RTOS theory (and most embedded RTOS deployments) deals with **concurrency on a single core**. Multicore RTOS (SMP/AMP, covered later in Advanced Topics) is where true parallelism enters the picture, and that introduces an entirely separate layer of complexity (cache coherency, spinlocks instead of just disabling interrupts, etc.).
+
+---
+
+**Every task needs its own private, independent execution context**
+
+For the "illusion of ownership" to work, each task must have components that are **entirely private to it** and never shared with other tasks:
+
+1. **Its own stack** — used for local variables, function call return addresses, and saved register values during a context switch. This is critical: if two tasks shared a stack, one task's local variables could be overwritten mid-execution by another task's function calls. Each task's stack size must be estimated (and ideally measured) individually — too small causes **stack overflow** (silent memory corruption in most embedded systems without MPU protection); too large wastes precious RAM, especially problematic when you have many tasks.
+
+2. **Its own saved register set** — when a task is not currently running, the CPU registers it was using (program counter, general-purpose registers, status flags) must be saved somewhere so they can be restored exactly when the task resumes, picking up exactly where it left off, as if it was never interrupted at all.
+
+3. **Its own priority, state, and scheduling metadata** — stored in the **Task Control Block (TCB)**, which is the *next* topic in the syllabus (I'll go deep on this separately since you listed it as its own topic).
+
+**What is deliberately shared (and why this matters):** Global variables, heap memory, peripherals, and most memory regions **are** shared across all tasks by default in most embedded RTOS (unless you're using an MPU to enforce isolation). This is a double-edged design choice:
+- **Pro:** No expensive IPC (inter-process communication) is needed just to share data — tasks can directly read/write shared globals, which is fast.
+- **Con:** This is the **root cause of race conditions** — if two tasks access the same shared variable without synchronization, and a context switch happens at the wrong moment mid-operation, data corruption results. This is why Section 6 (Synchronization) and Section 7 (Race Conditions, Critical Sections) exist as entire dedicated topics — they're solving a problem that exists *specifically because* tasks share memory by default.
+
+---
+
+**Task vs Thread vs Process — a corner case that causes real confusion**
+
+In general computing (Linux, Windows), these terms have very specific, different meanings:
+- A **process** has its own isolated **address space** (virtual memory) — one process cannot directly touch another process's memory at all, enforced by the MMU (Memory Management Unit).
+- A **thread** lives *inside* a process and **shares that process's address space** with other threads of the same process — multiple threads can directly read/write the same variables.
+
+In classic embedded RTOS (FreeRTOS, μC/OS, ThreadX on a microcontroller without an MMU), **there is usually no concept of separate "processes" at all** — everything runs in one shared, flat address space. So what RTOS documentation calls a "task" behaves theoretically like a **thread** (shared memory model), even though it's called a "task." This is a genuine terminology inconsistency across the industry:
+- **FreeRTOS** calls them "tasks."
+- **POSIX-based systems / Linux** call them "threads" (when part of the same process) or separate "processes" (when isolated).
+- **Zephyr RTOS** uses "threads."
+
+**Corner case worth knowing:** Some more advanced RTOS environments (e.g., RTOS running on a CPU *with* an MMU, or when using an MPU on ARM Cortex-M) *can* give each task its own protected memory region, closer to the "process" isolation model. This is used in **safety-critical systems** to prevent a bug in one task from corrupting another task's memory — but it comes at a real cost: MPU-based isolation prevents the fast, free sharing of global variables between tasks, forcing you to use explicit, controlled IPC (message queues) instead, which adds overhead and design complexity.
+
+---
+
+**Task independence and the theoretical requirement of "no assumed execution order"**
+
+A properly designed RTOS task must be written under one strict theoretical assumption: **it can be preempted at literally any instruction, at any time, by any higher (or equal, if time-sliced) priority task, and it cannot assume anything about when it will run relative to other tasks — only relative to explicit synchronization primitives it uses.**
+
+This has a subtle but important consequence: **you cannot rely on "Task A always happens to run before Task B" just because that's what you observed during testing.** This is one of the most common sources of real-world RTOS bugs — code that *appears* to work reliably for months because the scheduler *happens* to run tasks in a particular order under a particular timing pattern, until a change elsewhere in the system (a new task added, a slightly longer ISR, different sensor timing) shifts the scheduling pattern and the "implicit assumption" breaks, causing a bug that seems to appear "randomly" and is notoriously hard to reproduce and debug. This class of bug is called a **Heisenbug** informally (a bug that seems to change behavior or disappear when you try to observe/debug it, often because adding debug output changes timing enough to hide the race condition).
+
+**The correct theoretical mental model:** Any ordering guarantee between tasks *must* be explicitly enforced using a synchronization primitive (semaphore, mutex, queue, event flag) — never assumed from priority values, code structure, or empirical observation during testing.
+
+---
+
+**Task lifecycle — a brief bridge to the next topics**
+
+A task doesn't run continuously from creation to deletion — it moves through distinct **states** (Ready, Running, Blocked, Suspended, Terminated) based on scheduler decisions and its own calls (like `vTaskDelay()` or waiting on a semaphore). This state machine is significant enough that it's the very next topic in your syllabus, so I'll cover **Task States** next in the same depth, including the precise transition rules and corner cases (e.g., what exactly separates "Blocked" from "Suspended," and why that distinction matters for system design), unless you'd rather I continue with something else.
+
+## 2. RTOS Basic Concepts
+
+### Task States — Deeper Theory
+
+**Why states exist at all**
+
+A single CPU can only execute one task at a time (on a single core), but an RTOS may have dozens of tasks defined in the system. The scheduler needs a formal way to track **what each task is currently capable of doing** — is it eligible to run right now, is it actively running, is it waiting for something, or has it been deliberately taken out of contention entirely? This tracking is done through a **finite state machine**, where every task, at every moment, occupies exactly one well-defined state. This isn't just bookkeeping — the entire scheduling algorithm's correctness depends on these states being tracked precisely and transitioned atomically (i.e., a state change can't be "half-applied" if interrupted mid-update).
+
+---
+
+### The Core States
+
+Most RTOS (FreeRTOS, μC/OS, ThreadX, Zephyr) implement some variation of these five states:
+
+**1. Ready**
+
+- The task is **eligible to run** — it has everything it needs (no pending waits) — but is **not currently executing** because either the CPU is busy running a different task, or (in the case of equal-priority round-robin) it's simply not its turn yet.
+- Ready tasks live in a **Ready Queue** (often implemented as a priority-sorted list or, in more optimized kernels, an array of linked lists indexed by priority level — this data structure choice directly affects scheduling algorithm time complexity, discussed further below).
+- **Key theoretical property:** A task in the Ready state can transition to Running **only through the scheduler's explicit decision** — it never "runs itself."
+
+**2. Running**
+
+- The task is **currently executing on the CPU**, actively using the program counter and registers right now.
+- **Critical corner case on single-core systems:** At any given instant, **exactly one task can be in the Running state** — never zero (unless the idle task is running, which is itself a task, just a special one) and never more than one. On multicore/SMP systems, this changes to "one Running task per core," which is why SMP RTOS design (Advanced Topics, Section 17) requires fundamentally different data structures — a single "currently running task" pointer isn't enough; you need per-core tracking.
+
+**3. Blocked (also called Waiting or Pending, depending on the RTOS)**
+
+- The task **cannot currently run**, not because the CPU is busy, but because it is **explicitly waiting for something** — a delay to expire (`vTaskDelay()`), a semaphore to be given, a queue to have data, a mutex to be released, or an event flag to be set.
+- **The crucial theoretical distinction: Blocked is a self-initiated, temporary, condition-based state.** The task itself made an API call that says, essentially, "I have nothing useful to do until X happens — please don't schedule me until then." The RTOS removes it from the Ready Queue and places it onto a **wait list associated with the specific resource** it's waiting for (e.g., a list of tasks blocked on a particular semaphore).
+- **Automatic transition back to Ready:** The moment the awaited condition becomes true (semaphore given, timeout expires, data arrives in queue), the RTOS **automatically** moves the task from Blocked back to Ready — the task doesn't need to "check" anything itself; the kernel handles the wake-up as part of whichever API call satisfied the condition (e.g., another task calling `xSemaphoreGive()` triggers the kernel to scan that semaphore's wait list and wake up the blocked task).
+
+**4. Suspended**
+
+- The task is **explicitly and indefinitely removed from scheduling consideration**, regardless of any condition being met. Unlike Blocked, a Suspended task does **not** wake up automatically — it stays suspended until another task (or an ISR, in some RTOS) explicitly calls a "resume" function on it (e.g., `vTaskResume()`).
+- **The core theoretical distinction that's frequently tested/misunderstood: Blocked is condition-driven and automatic; Suspended is external and manual.**
+  - A Blocked task says: *"Wake me up when the semaphore is available."* — the kernel handles it.
+  - A Suspended task says nothing — it has been forcibly frozen by an outside decision (often another task or the application's control logic), with no built-in mechanism to wake itself up.
+- **Corner case:** What happens if a task is **Blocked** (waiting on a semaphore) and another task calls `vTaskSuspend()` on it? Most RTOS handle this by **overriding** the Blocked state with Suspended — the task is removed from the semaphore's wait list and placed into the Suspended state. Then, if someone later calls `vTaskResume()`, the task typically returns to **Ready**, not back to waiting on that semaphore — meaning **the original wait condition is effectively abandoned**. This is a subtle and dangerous corner case: naive use of suspend/resume on a task that was mid-wait can silently break the task's intended logic (it might now proceed past a point where it expected to have acquired a semaphore, without actually having acquired it) — a real source of bugs if not carefully understood.
+
+**5. Terminated (also called Deleted)**
+
+- The task has **finished execution** (its function returned, or it was explicitly deleted via an API call like `vTaskDelete()`) and its resources (stack memory, TCB) are being or have been reclaimed.
+- **Theoretical nuance:** In most embedded RTOS, a task function is written as an infinite loop (`while(1) {...}`) and is **never expected to return** — if a task function does return (falls off the end), this is typically treated as a fatal error condition (most RTOS documentation explicitly warns: a task function must never return; call `vTaskDelete(NULL)` explicitly if the task needs to end itself). This differs from general-purpose OS threading models, where a thread function returning normally is the standard, expected way to end a thread.
+- **Corner case on memory reclamation:** Depending on the RTOS and configuration, deleting a task might not **immediately** free its stack memory if the task is currently in a critical section or if deletion was requested by another task while this task wasn't actually running. Some RTOS use an **idle task hook** to perform deferred cleanup of deleted tasks' memory — meaning the Idle Task (a later topic) has a real, functional responsibility here, not just "run when nothing else needs the CPU."
+
+---
+
+### Some RTOS also define a "Pending Ready" / transitional micro-state
+
+This is a genuine corner case worth knowing at a deep level: in RTOS implementations that support **priority-based preemption triggered from an ISR**, there's a subtle timing question — if an ISR causes a high-priority task's wait condition to be satisfied (e.g., ISR calls `xSemaphoreGiveFromISR()`), does that task instantly become Running, or does it first become Ready and wait for the scheduler to formally run?
+
+**The precise theoretical answer:** The task transitions **Blocked → Ready** immediately as part of the ISR's semaphore-give operation. But it does **not** become Running immediately inside the ISR context — actual context switching only happens at a defined **scheduling point** (typically right when the ISR finishes, if the RTOS supports "context switch requested from ISR," a mechanism often exposed as `portYIELD_FROM_ISR()` in FreeRTOS). This distinction matters because:
+- If you forget to request this yield from within the ISR, the now-Ready high-priority task will sit in the Ready state, technically eligible to run, but **won't actually get the CPU until the next natural scheduling point** (e.g., the current task blocks, or the next system tick interrupt triggers a scheduler check). This is a real, common bug: **"I gave the semaphore from my ISR, but the waiting task didn't respond immediately"** — almost always caused by forgetting the ISR-to-scheduler yield call, not a fundamentally broken state machine.
+
+---
+
+### State Transition Diagram (conceptual)
+
+```
+                 ┌─────────────┐
+      Created───▶│    Ready    │◀────────────────┐
+                 └──────┬──────┘                  │
+                        │ Scheduler picks it       │ Wait condition met
+                        ▼                          │ (automatic)
+                 ┌─────────────┐                   │
+                 │   Running   │───────────────────┘
+                 └──────┬──────┘
+           ┌────────────┼─────────────┐
+           │            │             │
+  Preempted│      Calls wait API      │ Function returns /
+  (back to │      (delay, semaphore,  │ vTaskDelete()
+  Ready)   │      queue, mutex)       │
+           ▼            ▼             ▼
+     [back to Ready] [Blocked]  [Terminated]
+                        │
+              vTaskSuspend()
+              called on it
+                        ▼
+                  [Suspended] ──vTaskResume()──▶ [Ready]
+```
+
+*(Note: any state, including Running and Ready, can also transition to Suspended if `vTaskSuspend()` is called — the diagram above shows the most common Blocked→Suspended path, but suspension can be applied from most states depending on RTOS implementation.)*
+
+---
+
+### Deep corner case: Why does the Ready Queue's data structure matter for real-time guarantees?
+
+This connects Task States directly to scheduling theory (Section 3), so it's worth flagging now: how the RTOS **implements** the Ready Queue affects the **time complexity of finding the next task to run**, which directly impacts **scheduling determinism**.
+
+- **Naive implementation:** A single sorted linked list of all Ready tasks by priority — finding the highest-priority ready task is O(1) (it's always the head), but **inserting** a newly-Ready task into the correct sorted position is O(n) in the worst case (n = number of ready tasks), which means the "how long does it take to make a task Ready" operation has **variable, priority-count-dependent timing** — a red flag for hard real-time determinism if you have many tasks.
+- **Optimized implementation (used in production RTOS like FreeRTOS):** A **priority-indexed array of lists** — one linked list per distinct priority level, plus a bitmap where each bit indicates "is there at least one ready task at this priority level." Finding the highest-priority ready task becomes **O(1)** using a hardware instruction (like ARM's `CLZ` — Count Leading Zeros) to instantly find the highest set bit in the priority bitmap, and inserting a task into its priority's list is also O(1) (just appending to that priority level's list). This is *why* FreeRTOS and similar kernels can offer real **deterministic, priority-count-independent scheduling latency** — a direct, deliberate data structure decision made specifically to preserve hard real-time guarantees, not an incidental implementation detail.
+
+---
+
+## 2. RTOS Basic Concepts
+
+### Task Control Block (TCB) — Deeper Theory
+
+**What the TCB fundamentally is**
+
+The Task Control Block is a **data structure — essentially a C struct — that the RTOS kernel maintains, one per task, containing every piece of information the kernel needs to manage that task.** If a task is the *illusion* of an independently-running program, the TCB is the **ground truth record** the kernel actually manipulates to create that illusion. Every state transition discussed in the previous topic, every context switch, every priority-based scheduling decision — all of it works by the kernel reading and writing fields inside a task's TCB. Conceptually: **the task's code executes; the TCB is what allows the kernel to stop that execution, remember exactly where it was, and resume it later, possibly interleaved with dozens of other tasks doing the same thing.**
+
+---
+
+**The core fields, and why each one is theoretically necessary**
+
+1. **Stack Pointer (SP)**
+
+- This is arguably the single most important field in the entire TCB — it's usually the **very first field**, deliberately, because it's accessed on every single context switch, and keeping it first often allows a small performance optimization (some assembly-level context-switch routines access it via a known fixed offset from the TCB's base address, avoiding extra pointer arithmetic).
+- **What it stores:** Not the whole stack — just a pointer to the *current top* of this task's private stack, at the exact moment it was last preempted or voluntarily gave up the CPU.
+- **Theoretical mechanism:** When a context switch occurs, the current task's registers (general-purpose registers, program counter, status register) are **pushed onto that task's own stack**, and then the *stack pointer itself* is saved into the outgoing task's TCB. To resume a task later, the kernel does the reverse: load the stack pointer *from* the TCB into the CPU's actual stack pointer register, then **pop** all those saved registers back off that stack, and the very last "pop" effectively restores the program counter — meaning execution resumes exactly where it left off, at the exact instruction, with all register values exactly as they were.
+- **Corner case:** This is precisely why **each task must have its own separate stack memory region** — if two tasks shared one stack, this push/pop-based save-and-restore mechanism would immediately corrupt both tasks' data, because Task A's "saved registers" would sit on top of (or get overwritten by) Task B's active stack frame.
+
+2. **Task State**
+
+- A field (often an enum) holding the task's current state (Ready, Running, Blocked, Suspended, Terminated) as covered in the previous topic — this is the field the scheduler reads to decide eligibility, and writes to whenever a transition occurs.
+
+3. **Priority**
+
+- The task's assigned priority level (a number — implementation-specific whether higher numbers mean higher or lower priority; FreeRTOS uses higher number = higher priority, some other kernels use the opposite convention, which is a genuine, real-world source of porting bugs when developers move code between RTOS platforms without checking this convention).
+- **Corner case — Base Priority vs Current/Effective Priority:** Many production RTOS TCBs actually store **two separate priority values**, not one:
+  - **Base priority** — the priority the task was originally assigned at creation.
+  - **Current (effective) priority** — the priority the task is *actually* running at *right now*, which can be **temporarily elevated** above its base priority due to **Priority Inheritance** (covered in depth later, Section 7 — Priority Inversion). This distinction is essential: without tracking both values separately, the kernel would have no way to know what priority to *restore* the task to once the inheritance-causing condition ends (e.g., once a mutex is released).
+
+4. **Task ID / Handle**
+
+- A unique identifier (sometimes just the TCB's own memory address, used directly as the "handle" applications use to refer to the task — e.g., FreeRTOS's `TaskHandle_t` is literally a pointer to the TCB).
+
+5. **Task Name** (optional, debug-oriented)
+
+- A human-readable string, purely for debugging/tracing tools (RTOS-aware debuggers, trace tools like Percepio Tracealyzer) — has zero effect on scheduling behavior, but its presence/absence is a real design tradeoff: it costs RAM (every task pays for a name string buffer) purely for developer convenience, so some production, RAM-constrained builds disable it via a config flag.
+
+6. **Stack Base / Stack Limit (Boundaries)**
+
+- Pointers marking the start and end of this task's allocated stack memory region.
+- **Critical theoretical purpose — stack overflow detection:** Because embedded systems commonly run **without an MMU** (no hardware-enforced memory protection between tasks), the *only* way to detect that a task has overrun its allocated stack (and started corrupting adjacent memory — possibly another task's stack, or worse, kernel data structures) is **software-based checking**, using these stored boundary values. Most RTOS offer an optional "stack overflow check" that, on every context switch, compares the current stack pointer against the stored stack limit, or checks a "canary" pattern (a known fixed byte pattern written to the far end of the stack at task creation) to see if it's been overwritten. **Corner case:** This check only happens *at context switch time* (or at specific checkpoints) — it does **not** catch a stack overflow the instant it happens. If a task overflows its stack, writes garbage into adjacent memory, and that corrupted memory happens to be another task's critical data, damage can occur **before** the next stack-check point even runs — meaning stack overflow detection is a **best-effort, delayed-detection mechanism**, not a real-time-guaranteed safety net. This is precisely why hard real-time / safety-critical systems increasingly rely on hardware **MPU (Memory Protection Unit)** regions instead — which trigger an immediate hardware fault the *instant* an out-of-bounds write occurs, rather than waiting for a software check.
+
+7. **Delay/Wake Time (for Blocked tasks waiting on a timeout)**
+
+- Stores the absolute system tick count at which a currently-Blocked (delayed) task should be automatically woken and moved back to Ready.
+- **Corner case — how the kernel avoids checking every single TCB on every tick:** A naive implementation might loop through *every* task's TCB on every single system tick interrupt, checking "has this task's wake time arrived yet?" — this would be **O(n) per tick**, where n = total task count, which is a real determinism problem as task count grows (tick handling itself would then have unpredictable, task-count-dependent timing, undermining the very tick mechanism real-time scheduling depends on). Production RTOS instead maintain a **separate sorted "delayed task list"**, ordered by wake time — the tick handler only needs to check the **head** of this list (the single soonest-to-wake task) and compare it to the current tick count; if it hasn't reached that time yet, **nothing else needs to be checked at all**, making the common-case tick handling **O(1)**, regardless of how many tasks are in the system.
+
+8. **Event/Resource Wait Information**
+
+- If Blocked on a specific semaphore, queue, or mutex, the TCB (or a linked wait-list node associated with it) records *which* resource it's waiting on — needed so that when that resource becomes available, the kernel knows exactly which waiting task(s) to consider for wake-up.
+
+9. **Notification value / Direct-to-task notification state** (in more modern RTOS like recent FreeRTOS versions)
+
+- A lightweight built-in mechanism allowing a task to be signaled directly (a faster, lower-overhead alternative to a full semaphore in many use cases) — the TCB stores a small integer/bitfield value used for this purpose.
+
+---
+
+**Why the TCB's memory layout is itself a real-time engineering concern (not just "a struct")**
+
+This is a genuinely deep corner case that separates surface-level knowledge from real engineering understanding: **the exact byte-level layout of the TCB struct can matter for real-time performance**, for a subtle reason — the **context-switch routine is often written in hand-optimized assembly** (not C) for maximum speed and determinism, because context switching happens extremely frequently (potentially thousands of times per second) and its cost directly eats into the CPU time available for actual task execution. Hand-written assembly context-switch code frequently accesses TCB fields via **fixed, hardcoded byte offsets** from the TCB's base address, rather than through a compiler-generated struct field lookup. This means:
+- If you're porting an RTOS to a new architecture, or modifying kernel source, **carelessly reordering TCB struct fields can silently break the context switch routine** — the assembly code will read/write the wrong memory offset, corrupting task state in ways that may not manifest as an obvious, immediate crash, making it a particularly nasty class of bug.
+- This is also *why* the stack pointer field is so often placed first in the struct in real RTOS source code (e.g., FreeRTOS's `TCB_t` definition) — it's the single field accessed on literally every context switch, so its offset is the most performance-critical to keep simple and predictable (offset zero).
+
+---
+
+**TCB size as a real, non-trivial cost — a corner case in resource-constrained systems**
+
+Every single task created in the system pays a fixed RAM cost for its TCB (on top of its stack memory). In a system with severe RAM constraints (say, a few KB total), if you're designing a system with a **large number of small, short-lived tasks**, the **cumulative TCB overhead** (not just stack overhead) can become a meaningful fraction of total RAM usage. This is one of several concrete engineering reasons why RTOS design guides commonly recommend favoring **fewer, longer-lived tasks with well-defined responsibilities** over many small transient tasks, and why some systems favor lighter-weight constructs (like **software timers** or **event-driven callbacks executing within an existing task's context**) instead of spawning a whole new task (with a whole new TCB and stack) for every small, infrequent piece of work.
+
+---
+## 2. RTOS Basic Concepts
+
+### Context Switching — Deeper Theory
+
+**What a context switch actually is, precisely**
+
+A context switch is the mechanism by which the CPU **stops executing one task, fully preserves that task's exact execution state, and loads a different task's previously-preserved state, resuming it exactly where it left off** — all in a way that's completely invisible to the tasks themselves. Neither task "knows" it was ever paused; from each task's own point of view, it appears to have run continuously. This is the actual, physical mechanism that turns the theoretical "illusion of independent tasks" (from the Tasks/Threads topic) into working reality.
+
+---
+
+**The precise, step-by-step sequence of what happens**
+
+1. **Something triggers the need for a switch** (covered in detail further below — this is itself a rich topic).
+2. **The currently running task's context is saved.** "Context" means: all CPU general-purpose registers, the program counter (where execution currently is), the processor status register (flags like carry, zero, interrupt-enable state), and on some architectures, floating-point registers if in use. All of this is **pushed onto the current task's own private stack**.
+3. **The stack pointer, now pointing to the top of all that saved data, is written into the outgoing task's TCB** (specifically its Stack Pointer field, discussed in the previous topic) — this is the *only* place this task's entire execution state now exists, frozen in time.
+4. **The scheduler runs** — a piece of kernel code that examines the Ready Queue and determines which task should run next (this decision logic is Section 3: Scheduling, and will get its own deep dive).
+5. **The incoming (newly selected) task's Stack Pointer is read from its TCB**, and loaded into the CPU's actual stack pointer register.
+6. **All the previously-saved registers are popped back off that task's stack**, restoring every register to exactly the value it held the last time this task was interrupted.
+7. **The final pop effectively restores the program counter**, meaning the CPU's next fetched instruction is precisely the next instruction the incoming task was about to execute before it was last paused — execution resumes as if no time passed at all, from that task's own perspective.
+
+This entire sequence — steps 2 through 6 — is what's referred to as the **context switch**, and on most microcontroller-class RTOS, it's implemented as a small, extremely tight piece of **hand-written assembly**, precisely because it runs so frequently that even small inefficiencies compound into meaningful CPU overhead system-wide.
+
+---
+
+**What triggers a context switch — four distinct causes, each with different theoretical implications**
+
+1. **A task voluntarily blocks** (calls `vTaskDelay()`, waits on a semaphore/queue/mutex that isn't immediately available). Here the *outgoing task itself* initiates the switch by calling a kernel API — it's a **cooperative, self-requested** switch.
+
+2. **A higher-priority task becomes Ready**, typically as a result of an interrupt (e.g., an ISR calls `xSemaphoreGiveFromISR()`, waking a higher-priority task). This is a **preemptive** switch — the currently running task did *not* ask to be interrupted; the kernel forcibly takes the CPU away from it. **This is the defining mechanism that makes an RTOS "preemptive" rather than "cooperative."**
+
+3. **The task's time slice expires**, in systems using **time-sliced round-robin scheduling** among equal-priority tasks — a periodic system tick interrupt checks whether the currently running task has used up its allotted time quantum, and if so, forces a switch to the next equal-priority task even though nothing else "became ready."
+
+4. **The current task terminates or is deleted**, leaving no choice but to switch to whatever is next Ready.
+
+**Corner case — why distinguishing these matters theoretically:** Cases 1 and 4 happen at a point *chosen by the task itself*, meaning the task's own code is in a "safe," known state (it explicitly called a blocking or terminating function, so its own local invariants are consistent). Case 2, however, can happen at **literally any instruction boundary**, entirely outside the task's control or awareness — this is precisely *why* shared data between tasks requires explicit protection (mutexes/critical sections): a preemptive switch can occur in the middle of a multi-step operation on shared data, leaving that data in a temporarily inconsistent state, and the next task to read it (if not properly synchronized) will see broken, half-updated data. Case 2 is the real, root cause behind essentially every race condition discussed later in Section 7.
+
+---
+
+**"If something changes, what happens" — walking through real scenarios**
+
+**Scenario A: What if a higher-priority interrupt fires during an ongoing context switch itself?**
+
+This is a genuinely important corner case. Context switch code is typically executed with **interrupts either fully disabled, or at a specific elevated priority level**, for a precise reason: if an interrupt were allowed to fire *midway* through saving/restoring registers, and that interrupt itself triggered another context switch attempt, you could end up with a **partially-saved, partially-restored, inconsistent CPU state** — utterly corrupting the system. This is why the context switch routine is one of the most carefully guarded **critical sections** in the entire kernel, and why real-time systems must account for this brief "interrupts masked" window as one contributor to **worst-case interrupt latency** (mentioned earlier in the Polling vs Interrupt section) — even hardware events happening at the "worst possible instant" (right as a context switch begins) must wait for that switch to complete before being serviced.
+
+**Scenario B: What if a task is preempted while holding a mutex, and the incoming higher-priority task needs that same mutex?**
+
+The incoming task will attempt to acquire the mutex, find it already held, and **itself become Blocked**, going back through the scheduler to find the *next* runnable task — which might end up being the original, lower-priority task again (since it's now the only one that can make progress, by eventually releasing the mutex). This scenario, if the priorities and timing align a certain way, is the **entry point into Priority Inversion**, a formally named and seriously studied real-time problem (full depth reserved for Section 7, since it's its own listed topic) — but it's worth flagging here because it shows a concrete example of how a "normal" context switch can cascade into subtle system-wide timing problems.
+
+**Scenario C: What if two tasks of equal priority are both Ready at the same time, and one is running — what actually decides when the switch happens?**
+
+This depends entirely on whether the RTOS is configured for **time-slicing** among equal priorities:
+- **With time-slicing enabled:** The switch happens automatically at the next system tick, dividing CPU time round-robin between them, regardless of what either task's code is doing.
+- **Without time-slicing (common in many hard real-time configurations):** The running task keeps running **until it voluntarily blocks or is preempted by a strictly higher-priority task** — the equal-priority "waiting" task simply doesn't get a turn until the first one gives up the CPU on its own. **Corner case danger:** if that running task never blocks (e.g., it's stuck in an infinite loop or a bug prevents it from calling any blocking API), the equal-priority task **starves indefinitely** — this is a real, documented class of RTOS bugs, often the first thing engineers check when a task mysteriously "never runs" despite being created correctly.
+
+**Scenario D: What if the number of tasks increases significantly — does context switch cost increase?**
+
+This is an important, frequently misunderstood point: **the raw cost of performing a single context switch (the register push/pop assembly sequence) is constant — O(1) — regardless of how many total tasks exist in the system**, because it only ever touches *two* TCBs (the outgoing and incoming task) at a time. What **can** grow with task count is the **scheduler's decision-making cost** (finding *which* task to switch to) — but as covered in the Task States topic, well-designed RTOS use priority-bitmap-based Ready Queues specifically to keep even *that* decision at O(1), independent of task count. So in a well-implemented modern RTOS, adding more tasks does **not** inherently increase context-switch-related latency — the real cost that scales with task count is elsewhere (e.g., total RAM used by TCBs/stacks, or in poorly-implemented custom schedulers that weren't built with O(1) lookup).
+
+**Scenario E: What if the CPU has hardware floating-point registers, and only some tasks use floating-point math — does every context switch save/restore FPU state?**
+
+This is a genuine, real-world optimization corner case: saving/restoring FPU registers adds real overhead to every context switch, but **most tasks in a typical embedded system never use floating point at all** (e.g., a UART-handling task or a button-debounce task has no reason to). Paying the FPU save/restore cost on *every* switch, for *every* task, would be wasteful. Production RTOS commonly implement **"lazy FPU context switching"**: the FPU registers are only saved/restored for a task if that task is specifically marked (often via a flag set at task creation, or auto-detected via a hardware fault triggered the first time FPU instructions are used) as an FPU-using task. This keeps the common-case context switch cost lower for the majority of tasks that never touch floating point — a direct, deliberate example of the general RTOS design philosophy: **pay overhead only where it's actually needed, because overhead directly threatens worst-case timing guarantees.**
+
+---
+
+**Context Switch Time as a formally measured, critical RTOS metric**
+
+Unlike a GPOS (where context switch time is a minor performance statistic), in RTOS engineering, **context switch time is a first-class number that must be known precisely and included in schedulability calculations.** It directly appears as a real component of a task's effective worst-case response time — if a higher-priority task becomes ready, the system's true response time isn't just "however long the ISR takes" — it's **ISR time + context switch time + scheduler decision time**, all of which must be summed and bounded for a valid hard real-time guarantee. This is precisely why RTOS vendors and evaluators publish **benchmark context switch times** (often measured in a small number of CPU cycles or a handful of microseconds) as a key differentiator between RTOS products — it's not a vanity metric, it's a direct input into whether a given system design can be mathematically proven to meet its deadlines.
+
+---
+## 2. RTOS Basic Concepts
+
+### Dispatcher — From Zero to Pro
+
+Let me slow down here and build this one from the ground up, because most people confuse "Scheduler" and "Dispatcher" for years — even in interviews, this trips people up. I'll make sure that confusion never happens to you.
+
+---
+
+**Start with a real-world analogy (fresher-level intuition first)**
+
+Imagine an airport control tower.
+
+- Someone has to **decide** which plane lands next — checking priorities, fuel levels, emergencies. That decision-maker is the **Scheduler**.
+- Someone else has to **actually execute** that decision — physically guide that specific plane onto the runway, right now, with precise timing. That executor is the **Dispatcher**.
+
+In many textbooks, "Scheduler" and "Dispatcher" get used loosely as if they're the same thing. In a pro-level understanding, they are **two separate responsibilities** — sometimes even literally two different pieces of kernel code:
+
+- **Scheduler** = the decision-making logic. *"Given all Ready tasks, which one deserves the CPU next?"* This is a policy question — it looks at priorities, states, timing rules.
+- **Dispatcher** = the mechanism that carries out that decision. *"Okay, the scheduler picked Task X — now physically switch the CPU to run Task X."* This is a mechanical, low-level action — it's the piece that actually performs (or triggers) the context switch we just covered.
+
+**Why this separation matters, at a pro level:** In real kernel source code (like FreeRTOS), the scheduler's decision (which task should run) and the dispatcher's action (making it actually run, via the context-switch assembly) are often distinct functions, sometimes even called at different moments. Understanding them as separate lets you reason clearly about **where time is spent** and **where bugs can hide** — "was the wrong task selected?" is a scheduler bug; "was the right task selected but never actually loaded onto the CPU?" is a dispatcher bug. These are different classes of problems, and a fresher who thinks "scheduler = dispatcher" will struggle to localize real kernel bugs later.
+
+---
+
+**What the Dispatcher does, precisely, step by step**
+
+Once the scheduler has decided "Task X is next," the dispatcher's job is:
+
+1. **Save the currently running task's context** (as covered in detail in Context Switching) — or more precisely, the dispatcher is the code that *performs* that save.
+2. **Update task states** — mark the outgoing task's state field in its TCB (e.g., from Running → Ready, or Running → Blocked, depending on *why* the switch is happening).
+3. **Update the "currently running task" pointer** the kernel maintains — this is a critical piece of kernel-internal bookkeeping: at all times, the kernel keeps one pointer/variable saying "this TCB is the one currently executing." The dispatcher changes this pointer to point at the new task's TCB.
+4. **Restore the incoming task's saved context** from its TCB (loading its stack pointer, popping its registers back).
+5. **Resume execution** — literally, the CPU's next instruction is now inside the newly dispatched task.
+
+So in one sentence, at pro level: **the Scheduler answers "who," the Dispatcher answers "how," and the actual mechanical register-save/restore steps we detailed under Context Switching are the Dispatcher's toolkit for carrying out its job.**
+
+---
+
+**When exactly does the Dispatcher run? (This is where fresher-level understanding usually breaks down)**
+
+Here's the subtlety a fresher almost never gets told clearly: **the dispatcher doesn't run "whenever it wants" — it only runs at specific, well-defined points called scheduling points (or preemption points).**
+
+The dispatcher is invoked from a small number of specific trigger locations in the kernel:
+
+- **Inside the SysTick (system tick) interrupt handler** — every periodic timer tick, the kernel checks if a switch is needed (e.g., a delayed task's timer expired, or a time-slice expired) and invokes the dispatcher if so.
+- **Inside a kernel API call that a task makes**, like `vTaskDelay()` or `xSemaphoreTake()` when blocking is required — the moment a task blocks itself, the kernel immediately triggers the dispatcher to hand the CPU to someone else, rather than wasting cycles.
+- **Inside (or right after) an ISR**, specifically when that ISR calls something like `portYIELD_FROM_ISR()` — this is the exact mechanism I flagged as a common beginner bug in the Task States discussion: if an ISR wakes up a higher-priority task but never explicitly requests a dispatch, the dispatcher won't run until the *next* natural trigger point (like the next tick), even though, logically, the higher-priority task should run immediately.
+
+**Pro-level takeaway:** A context switch is never "spontaneous." Someone — a tick handler, a blocking API call, or an ISR — must explicitly ask the dispatcher to act. This is precisely why, as a professional embedded engineer, when you see "my high-priority task responded late even though the semaphore was given right away," your first instinct should be: **"did the ISR that gave the semaphore actually request a yield/dispatch, or did it just give the semaphore and return normally?"** This single insight — knowing exactly *where* dispatch decisions get triggered — separates someone who memorized RTOS theory from someone who can actually debug a misbehaving real-time system.
+
+---
+
+**Corner case: What if the Dispatcher decides "nothing needs to change"?**
+
+Not every scheduling point results in an actual switch. For example, the tick interrupt fires, the scheduler checks the Ready Queue, and determines the currently running task is *still* the highest-priority ready task — nothing changes. In this case, the dispatcher performs **no context switch at all** — it would be pure wasted overhead to save and restore the exact same task's context for no reason. Well-designed kernels explicitly check "is the newly selected task the same as the currently running task?" before doing any actual save/restore work, specifically to avoid this unnecessary cost. This might sound obvious, but it's a genuine, deliberate optimization that matters at scale — with a tick firing potentially 1000 times per second, avoiding pointless context switches when nothing actually changed is a real performance and determinism consideration.
+
+---
+
+**Corner case: What if two tasks of the exact same priority are both Ready, and the current one is still running with time-slicing enabled?**
+
+Here, even though "the highest priority hasn't changed," the dispatcher *will* still switch — not because a higher-priority task appeared, but because the **time-slice policy itself** says "this task's fair share of CPU time for this round is over, rotate to the next task at this same priority level." This is a case where the *scheduler's policy* (round-robin among equals) directly drives the dispatcher to act, even without any state change beyond "time's up." It's a good example of why you always need to know *which scheduling policy* is active to correctly predict dispatcher behavior — the same system state (multiple Ready tasks, one Running) can lead to different dispatcher decisions depending purely on configuration.
+
+---
+
+**Pro-level summary, in one paragraph:**
+
+The Dispatcher is the **enforcement arm of the scheduler's decisions** — it never decides policy, it only executes mechanics: save old context, update bookkeeping (TCB states, the running-task pointer), restore new context. It only ever runs at defined scheduling points (tick interrupts, blocking API calls, ISR-requested yields) — never randomly mid-instruction. And a huge share of real-world "why didn't my task run when I expected" bugs trace back to **a scheduling point that should have triggered a dispatch, but didn't get explicitly requested** — especially the classic ISR-forgets-to-yield mistake. Internalizing that distinction — decision (scheduler) vs. execution (dispatcher), and knowing exactly where execution gets triggered — is genuinely one of the things that separates textbook RTOS knowledge from real production debugging skill.
+
+---
+## 2. RTOS Basic Concepts
+
+### Idle Task — From Zero to Pro
+
+**Start with the question a fresher should be asking**
+
+Here's a gap most beginners never think to question: **what does the CPU actually do at the exact moment when every single task in the system is Blocked, Suspended, or otherwise not Ready?** A CPU can't just "do nothing" — it's a piece of hardware that's always executing *some* instruction, at every clock cycle, unless explicitly halted. So the RTOS needs *something* for the CPU to run in that gap. That "something" is the **Idle Task**.
+
+---
+
+**What the Idle Task actually is**
+
+The Idle Task is a **special, kernel-created task that exists automatically in every RTOS** — you don't write it yourself, and you can't (normally) delete it. It's created by the kernel at startup, and it's deliberately given the **lowest possible priority in the entire system** — always, by design, lower than every single application task you create.
+
+**Why the lowest priority, precisely:** Because its entire purpose is to be the "last resort" — the thing that runs **only when literally nothing else has useful work to do.** The moment *any* application task becomes Ready, the scheduler's normal priority-based logic guarantees that task preempts the Idle Task immediately, because nothing has a lower claim on the CPU than the Idle Task by definition.
+
+---
+
+**What it actually does — the naive version first**
+
+At the simplest conceptual level, the idle task is just:
+
+```c
+void IdleTask(void) {
+    while(1) {
+        // do nothing meaningful, just loop
+    }
+}
+```
+
+That's the fresher-level mental model, and it's *mostly* right in spirit — but the pro-level understanding is that this "empty loop" is not actually wasted or meaningless. Real production RTOS use this loop for several genuinely important background responsibilities. Let's go through them.
+
+---
+
+**Real responsibility #1: Deferred cleanup of deleted tasks**
+
+Remember from the TCB discussion — when a task is deleted (`vTaskDelete()`), its **stack memory and TCB memory need to be freed**. But there's a subtlety: what if the task being deleted is deleting *itself*, or what if it's deleted at a moment where immediately freeing its own stack memory would be dangerous (you can't safely free memory you're currently executing on top of)? 
+
+**The elegant solution:** Deletion doesn't necessarily free memory immediately — it often just marks the task as Terminated and adds it to a cleanup list. The **Idle Task**, running later, is given the responsibility of going through that list and actually performing the `free()` calls, safely, from a context that isn't the deleted task itself. This is a genuinely important, non-obvious reason the Idle Task exists as a *real* task with *real* code, not just a placeholder — **if you never let the Idle Task run (e.g., because your application tasks are greedy and rarely block), deleted tasks' memory may never actually get reclaimed**, causing a slow memory leak in a system that looks, on the surface, like it's correctly calling `vTaskDelete()`.
+
+**Corner case (a very real, very common production bug):** Developers write a system with several high-priority tasks that are almost always Ready (rarely blocking), starving the Idle Task of CPU time. Task deletion appears to work — the task stops running — but memory usage slowly climbs over hours or days because cleanup never actually executes. The fix isn't "delete tasks differently" — it's ensuring the Idle Task actually gets scheduled periodically, which is a design-level scheduling concern, not a memory management bug in the traditional sense.
+
+---
+
+**Real responsibility #2: The Idle Hook (your own custom code)**
+
+Most production RTOS let you register an **Idle Hook** — a callback function *you* write, which the kernel calls every time the Idle Task runs. This gives application developers a safe, designated place to put low-priority background work — things that should only happen when the system genuinely has spare capacity.
+
+Common real uses:
+- **Putting the CPU into a low-power sleep mode** (this is the direct mechanical link to the later topic of **Tickless Idle Mode** — the idle hook is literally where the "should we sleep the CPU now?" decision and action typically live).
+- **Feeding a watchdog timer** in systems where "the system is still alive and responsive" is defined as "the idle task still gets to run sometimes" (more on this corner case below).
+- **Collecting CPU usage statistics** — some RTOS estimate CPU load by measuring how much time is spent in the Idle Task versus real work; less idle time = higher CPU utilization.
+
+**Pro-level warning about the Idle Hook — a genuine, well-documented pitfall:** Your idle hook function **must never block or call any RTOS API that could cause it to wait** (like `vTaskDelay()` or taking a semaphore that might not be available). Why? Because the Idle Task is the ultimate fallback — if it ever becomes Blocked, and every other task is *also* Blocked at that same moment, there would be **no Ready task in the entire system at all**, and the scheduler would have nothing valid to dispatch. Most RTOS treat this as an undefined or fatal condition. The Idle Task's whole reason for existing is to **always be available as Ready**, precisely so the CPU always has somewhere to go.
+
+---
+
+**Real responsibility #3: Tickless Idle / Power Management (brief preview, full depth reserved for Section 15)**
+
+In power-sensitive, battery-operated embedded systems, simply looping empty instructions in the Idle Task still burns power unnecessarily — the CPU stays fully clocked and active even though it has nothing to do. Advanced RTOS configurations use the Idle Task as the trigger point to instead:
+
+1. Calculate how long the CPU can safely sleep (based on the soonest upcoming timer/task wake-up event).
+2. Actually put the CPU into a genuine low-power sleep state for approximately that duration.
+3. Wake up (via a timer or external interrupt) and resume idle-task execution, letting the dispatcher take over from there if a task is now Ready.
+
+This is why the Idle Task isn't just "wasted filler code" from a pro perspective — in a well-engineered low-power RTOS system, it's the **exact place where the software decides to stop wasting battery.**
+
+---
+
+**Corner case: Watchdog timers and the Idle Task — a subtle system-design interaction**
+
+Some systems use a **watchdog timer** (hardware that resets the whole device if not periodically "fed"/reset by software) as a last-resort safety mechanism against total system lockup (e.g., an infinite loop bug, a deadlock). A design choice some engineers make: **feed the watchdog from inside the Idle Task's hook.**
+
+**Why this is clever, at a pro level:** If the system has genuinely locked up — say, a high-priority task is stuck in an infinite loop, or there's a deadlock among several tasks — the Idle Task, being lowest priority, will **never get scheduled**, because something (even if it's broken/stuck) is always technically "Ready" and higher priority. If the Idle Task never runs, the watchdog never gets fed, and the hardware watchdog eventually **force-resets the entire device** — providing a real safety net against total system freezes, without needing complex deadlock-detection logic.
+
+**But here's the corner case that trips people up:** This only protects against *total* system lockup, not against a *single lower-priority task* being starved while the rest of the system functions "normally." If your watchdog-feeding logic lives in the Idle Task, and the Idle Task manages to run periodically even though some *specific, important-but-not-highest-priority* task is being starved by other tasks, **the watchdog will happily keep getting fed, masking a real starvation bug** that a naive engineer might have expected the watchdog to catch. Pro-level understanding: a watchdog fed from the Idle Task tells you **"the system isn't fully frozen"** — it does *not* tell you **"every task is getting fair or correct CPU time."** These are genuinely different guarantees, and conflating them is a common design mistake.
+
+---
+
+**Pro-level summary in one paragraph**
+
+The Idle Task isn't a placeholder or an afterthought — it's a **real, kernel-managed task with genuine responsibilities**: deferred memory cleanup for deleted tasks, a safe home for user-defined low-priority background work via the idle hook, the trigger point for power-saving sleep decisions, and often the anchor point for watchdog-based system-lockup protection. Its defining constraint — lowest priority, must never block — is what guarantees the CPU always has *something* valid to execute, which is precisely the property that makes the overall dispatcher/scheduler system always well-defined, with no "nothing to run" edge case left unhandled. And the practical, real-world bug pattern to remember: **starving the Idle Task doesn't just waste an opportunity for power savings — it can silently break deleted-task memory cleanup and mask real scheduling problems from your watchdog.**
+
+---
+## 2. RTOS Basic Concepts
+
+### System Tick / Tick Timer — From Zero to Pro
+
+**Start with the fundamental question: how does an RTOS know time has passed at all?**
+
+Here's something a fresher rarely stops to think about: a CPU, by itself, has no built-in sense of "10 milliseconds have passed." It just executes instructions, one after another, as fast as its clock allows. So when you call `vTaskDelay(100)` expecting your task to sleep for roughly 100 milliseconds, **something** has to actually be counting time and waking your task up at the right moment. That "something" is the **System Tick** — and understanding it properly is what lets you reason about *every* timing guarantee an RTOS makes, including their limits.
+
+---
+
+**What the System Tick actually is, mechanically**
+
+The System Tick is a **periodic hardware timer interrupt**, configured to fire at a fixed, regular interval — commonly every 1ms or 10ms, though it's fully configurable based on your application's needs. Every single time this interrupt fires, a specific piece of kernel code — the **Tick Handler (Tick ISR)** — runs, and this is genuinely one of the most important, most frequently executing pieces of code in the entire RTOS.
+
+On most microcontrollers, this is implemented using a dedicated hardware peripheral built exactly for this purpose — for example, ARM Cortex-M processors have a built-in **SysTick timer**, a simple 24-bit down-counter that automatically reloads and fires an interrupt every time it reaches zero, specifically designed to make this "OS heartbeat" pattern easy and standard across ARM-based RTOS implementations.
+
+---
+
+**What the Tick Handler actually does, step by step**
+
+Every single tick interrupt, the kernel typically performs several distinct jobs, in sequence:
+
+1. **Increment the global tick counter.** This is a single, ever-increasing number representing "how many ticks have occurred since the system started." Every timing decision in the entire RTOS is ultimately expressed in terms of this counter, not "real" wall-clock time directly.
+
+2. **Check the Delayed Task List** (introduced back in the TCB discussion) — remember, this list is kept **sorted by wake-up tick value**, specifically so this check can be **O(1)** rather than scanning every task. The tick handler compares the current tick count against the *head* of that list — if a task's wake time has arrived, it's moved from Blocked back to Ready. This check repeats for as many tasks at the front of the list as have reached their wake time (in case multiple tasks were due at the same tick).
+
+3. **Handle time-slice bookkeeping**, if round-robin time-slicing is enabled — decrementing the currently running task's remaining time-slice budget, and flagging that a switch is needed if it's hit zero.
+
+4. **Decide whether a context switch is needed**, based on everything above (a task just became Ready with higher priority, or a time-slice expired) — and if so, request the dispatcher to act, exactly like the ISR-yield mechanism discussed earlier.
+
+5. **Return from the interrupt**, letting the dispatcher (if triggered) actually perform the switch.
+
+---
+
+**The critical, pro-level insight: RTOS "milliseconds" are not continuous — they're quantized**
+
+This is the single biggest conceptual leap from fresher to pro understanding of timing in an RTOS: **when you call `vTaskDelay(100)`, you are not asking for "exactly 100 milliseconds of real time."** You're asking to be blocked for **100 tick periods**, and your actual wake-up only happens the next time the tick handler runs and notices your wake time has been reached.
+
+**Why this distinction matters — the exact corner case:**
+
+Suppose the tick period is 1ms, and you call `vTaskDelay(100)` (intending "delay 100ms") at a moment that happens to be **0.9ms into the current tick period** (i.e., you're calling it just before the next tick is about to fire).
+
+- The kernel doesn't know or care how far into the current tick period you are — from its perspective, "now" is simply the last tick count it incremented.
+- It computes your wake-up tick as `current_tick + 100`.
+- But because you called `vTaskDelay()` so close to the *next* tick boundary, that "current tick" is about to advance almost immediately (in this example, in just 0.1ms) — meaning your *effective* delay could be as low as **99.1ms**, not a full 100ms.
+- Conversely, if you'd called `vTaskDelay(100)` *immediately after* a tick just fired, your effective delay could be nearly a full **101ms**, because you get almost one full extra tick period "for free" before the countdown even conceptually starts.
+
+**The formal, pro-level statement of this:** `vTaskDelay(N)` guarantees a delay of **at least N tick periods**, but the *actual* elapsed real time can be anywhere from `(N-1) × tick_period` up to `N × tick_period`, depending on exactly where in the current tick cycle the call happens. This ±1 tick period of uncertainty is called **tick jitter**, and it's a fundamental, unavoidable consequence of quantizing time into discrete tick periods — not a bug, a **theoretical property of the mechanism itself.**
+
+**Why this matters practically:** If your tick period is 10ms and your application logic assumes `vTaskDelay(10)` means "exactly 10ms, precisely," you will eventually get bitten by timing that's actually off by nearly a full tick period — this is a real, common source of subtle timing bugs, especially in control loops or protocols with tight timing tolerances.
+
+---
+
+**The direct engineering tradeoff: tick frequency vs system overhead**
+
+This is where pro-level judgment comes in — **choosing the tick period is a genuine design decision with real tradeoffs, not an arbitrary default:**
+
+- **Faster tick (e.g., 1ms, meaning 1000 ticks/second):**
+  - **Pro:** Finer-grained timing resolution — less tick jitter, `vTaskDelay()` calls are more precise, and time-sliced round-robin scheduling switches more responsively between equal-priority tasks.
+  - **Con:** The tick handler itself runs 1000 times per second, and **every single one of those executions consumes real CPU cycles** — checking the delayed list, incrementing counters, potentially triggering context switches. At very high tick rates, this overhead becomes a non-trivial percentage of total CPU capacity, purely spent on "bookkeeping," not actual application work.
+
+- **Slower tick (e.g., 100ms, meaning 10 ticks/second):**
+  - **Pro:** Far less CPU overhead spent on tick handling — more cycles available for real work, and (very relevant in battery-powered systems) **fewer wake-ups from sleep**, meaning the CPU can stay in a low-power state longer between tick interrupts, directly benefiting battery life.
+  - **Con:** Coarse timing resolution — `vTaskDelay(1)` might not even be meaningfully expressible if your desired delay is smaller than one full tick period, and tick jitter becomes proportionally much larger relative to short delays.
+
+**This tradeoff is precisely why Tickless Idle Mode exists (previewed in the Idle Task discussion, full depth in Section 15):** instead of committing to one fixed tick rate as a permanent compromise, a tickless system **dynamically suppresses tick interrupts entirely** during idle periods (when no task is waiting for a nearby wake-up), and only reprograms the timer to fire exactly when the *next actually necessary* event will occur — getting the power-saving benefit of a slow tick during idle time, without permanently sacrificing fine-grained timing resolution when the system is actually busy.
+
+---
+
+**Corner case: Tick counter overflow — a real, must-handle detail**
+
+The tick counter is typically a fixed-width integer (commonly 32-bit in most modern RTOS, though historically some used 16-bit, which made this problem far more urgent). At some point, if the system runs long enough, this counter will **overflow and wrap back to zero.**
+
+**Why this is a genuine engineering concern, not just trivia:** with a 32-bit tick counter incrementing at 1ms per tick, overflow occurs after roughly **49.7 days** of continuous uptime. Any comparison logic like `if (current_tick >= task_wake_tick)` will **break incorrectly** the moment `current_tick` wraps around to a small number while `task_wake_tick` (computed before the wrap) is still a large, pre-wrap value — naively, the condition would evaluate as false indefinitely, potentially leaving a task blocked forever past its intended wake time.
+
+**How production RTOS actually solve this:** rather than direct comparison, kernel code uses **unsigned integer subtraction with wraparound-safe comparison logic** — computing `(current_tick - task_wake_tick)` using unsigned arithmetic naturally handles the wraparound correctly (this exploits how unsigned integer overflow/underflow behaves predictably in two's complement arithmetic), as long as the actual time difference being compared never exceeds half the counter's total range. This is a subtle, well-known kernel engineering pattern — and it's exactly the kind of corner case that separates someone who's only ever used an RTOS's *API* from someone who understands *why* certain API design choices (like using tick deltas rather than absolute comparisons) exist in the first place.
+
+---
+
+**Pro-level summary in one paragraph**
+
+The System Tick is the RTOS's heartbeat — a periodic hardware interrupt whose handler advances the global time reference, wakes up tasks whose delays have expired (efficiently, via a sorted delayed-task list), and drives time-sliced scheduling decisions. Every timing API in the RTOS (`vTaskDelay`, timeouts on semaphores/queues, software timers) is fundamentally built on top of this discrete, quantized tick counter — which means **all RTOS timing has an inherent ±1 tick period of jitter**, a real theoretical limit, not an implementation flaw. Choosing the tick rate is a genuine tradeoff between timing precision and CPU/power overhead, which is precisely the problem Tickless Idle Mode is engineered to solve dynamically. And tick counter overflow, while easy to overlook, is a real, must-handle corner case in any long-running production system, solved through wraparound-safe unsigned arithmetic rather than naive direct comparison.
+
+---
+
+That completes **Section 2: RTOS Basic Concepts** in full depth (Tasks/Threads, Task States, TCB, Context Switching, Dispatcher, Idle Task, System Tick).
+
