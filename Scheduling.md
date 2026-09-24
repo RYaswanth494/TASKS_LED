@@ -622,4 +622,100 @@ Recall from Priority-Based Scheduling that low-priority *tasks* can be starved i
 Multilevel Queue Scheduling partitions tasks into distinct, strictly-prioritized queues (each potentially using a different internal scheduling algorithm suited to that category's needs), with strict priority enforced *between* queues exactly as it would be between individual task priorities — a higher queue completely preempts a lower one whenever it has any Ready task at all. Its real value is architectural: it lets different task categories use genuinely different, appropriate scheduling philosophies while enforcing clean, deliberate separation between critical and non-critical work by design, rather than by careful individual priority-number bookkeeping alone. Its dynamic cousin, Multilevel Feedback Queue, adds task migration between queues based on observed behavior — a powerful technique in general-purpose OS design, but fundamentally incompatible with the static, provable priority assumptions that hard real-time schedulability analysis (RMS, in particular) depends on, which is exactly why classic hard RTOS rarely uses MLFQ despite its popularity in general-purpose systems. And because starvation now applies at the whole-queue level, a pro-level design must explicitly verify that any lower-priority queue's tasks either tolerate indefinite starvation by design, or are protected by some additional reserved-bandwidth mechanism.
 
 ---
+## 3. Scheduling
+
+### Scheduling Latency & Jitter — From Zero to Pro
+
+**Start with why this topic exists separately, even after covering all the algorithms**
+
+Every scheduling algorithm we just covered (RMS, EDF, LLF, Round Robin) answers the question "who runs next?" in an idealized, mathematical sense — but none of them, by themselves, account for the **real, physical delay between "an event that should trigger a task to run" and "that task actually executing on the CPU."** That gap — the difference between the theoretical, instantaneous scheduling decision and the actual, measurable delay in real hardware — is what **Scheduling Latency** and **Jitter** describe. This is the topic that connects all the clean math you just learned to the messy reality of physical interrupt controllers, context-switch cycles, and software overhead.
+
+---
+
+### Scheduling Latency — precise definition
+
+**Scheduling Latency = the time between when a task *becomes* Ready (its triggering event occurs) and the moment it actually *starts executing* on the CPU.**
+
+This is not one single, simple number — it's the **sum of several distinct, separately-analyzable components**, and a pro-level engineer must be able to name each one, not just say "there's some delay":
+
+1. **Interrupt Hardware Latency** — the delay between the physical event (a pin toggling, a peripheral flag setting) and the CPU's interrupt controller actually recognizing and raising the interrupt request. Determined by hardware (interrupt controller design, bus speed), largely outside software's control.
+
+2. **Interrupt Disable Time** — if interrupts are masked at the exact moment the event occurs (because some other code is inside a critical section), the ISR **cannot run at all** until they're re-enabled. This is, in almost every real system, **the single largest and most software-controllable contributor to scheduling latency** — directly tied back to how disciplined your critical-section design is (Section 6/7 territory).
+
+3. **ISR Execution Time** — the time the Interrupt Service Routine itself takes to run before it signals the waiting task (e.g., calling `xSemaphoreGiveFromISR()`). This is why the "keep ISRs short" principle from Section 9 isn't just good practice — it's a **direct, quantifiable input into scheduling latency.**
+
+4. **Scheduler Decision Time** — once the task is marked Ready, how long does it take the scheduler to determine that this task should now run? Recall from Task States: a well-implemented priority-bitmap Ready Queue makes this **O(1)**, essentially negligible — but a naive linked-list implementation could make this cost scale with task count, directly inflating latency in a way that's easy to overlook if you don't know to check.
+
+5. **Context Switch Time** — the actual register save/restore mechanics covered in full depth earlier — a fixed, architecture-dependent cost, but non-zero, and it must be included in any honest latency calculation.
+
+**The complete formula, pro-level:**
+
+```
+Scheduling Latency = Interrupt Hardware Latency
+                    + Interrupt Disable Time (worst case)
+                    + ISR Execution Time
+                    + Scheduler Decision Time
+                    + Context Switch Time
+```
+
+**Pro-level insight:** When someone claims "our RTOS has 2 microseconds of scheduling latency," a pro immediately asks: **"Is that a measured average, or a proven worst-case bound?"** — because for hard real-time guarantees, only the **worst-case** value across all five components matters. A system that's fast on average but has an unbounded worst-case interrupt-disable time (say, because some rarely-executed code path holds a critical section far too long) does **not** have a real, provable latency bound, no matter how good the average measurement looks. This directly echoes the earlier warning from Section 1 about WCET analysis versus average-case benchmarking — the same principle applies here, specifically to latency.
+
+---
+
+### Jitter — precise definition, and how it's genuinely different from latency
+
+**Jitter = the variation in scheduling latency (or in task completion timing) from one occurrence to the next — it's not "how long is the delay," it's "how much does that delay change, cycle to cycle."**
+
+This is the exact concept you asked about at the very start of this whole conversation — but now you have the full machinery underneath it to understand *why* it happens, precisely.
+
+```
+Cycle 1: Task triggered, starts running after 50µs   (latency = 50µs)
+Cycle 2: Task triggered, starts running after 53µs   (latency = 53µs)
+Cycle 3: Task triggered, starts running after 48µs   (latency = 48µs)
+Cycle 4: Task triggered, starts running after 61µs   (latency = 61µs)
+
+Average latency ≈ 53µs
+Jitter ≈ ±13µs (the spread/variation around that average)
+```
+
+**Why jitter can be a serious problem even when average latency is perfectly acceptable:** Consider a motor control loop that needs to sample and adjust every 1ms. If latency is a **consistent** 50µs every single cycle, the control algorithm can actually be *designed to compensate* for that fixed, known delay (predictable delay is mathematically easy to account for in a control system). But if that same 50µs average latency **varies unpredictably** between, say, 30µs and 90µs cycle to cycle, the control algorithm **cannot compensate** — it doesn't know, in advance, which value will occur this time. This unpredictability directly translates into **control instability, oscillation, or degraded precision** in real physical systems — which is exactly why jitter, not just raw latency, is often the more critical metric in precision control applications.
+
+---
+
+**Root causes of jitter — connecting directly back to earlier topics**
+
+1. **Variable interrupt-disable time** — if different code paths hold critical sections for different durations depending on runtime conditions (e.g., a critical section that sometimes processes 1 item and sometimes processes 10, due to a queue backlog), the worst-case interrupt-disable component of latency **isn't fixed** — it varies based on system state, directly producing jitter.
+
+2. **Cache effects** — this is a genuinely important, often-overlooked corner case for systems with CPU caches: the *first* time an ISR or task's code executes after being idle, its instructions and data may need to be fetched from slower main memory (a **cache miss**), taking longer; on a subsequent, "hot cache" execution, the same code runs faster purely because it's already cached. This means **identical code, running the identical logical operation, can take measurably different amounts of time on different invocations, purely due to cache state** — a real, physical source of jitter that has nothing to do with your scheduling algorithm or priority design at all, and is a genuine reason why real-time systems sometimes deliberately **lock certain critical code/data into cache** (a technique called cache locking or cache pinning) specifically to eliminate this variability.
+
+3. **Priority Inversion events** (Section 7 territory) — an occasional, unpredictable priority inversion (even one correctly resolved via priority inheritance) introduces an extra, variable delay on some cycles but not others, directly producing jitter in the affected task's timing.
+
+4. **DMA and bus contention** — if a task's memory access happens to coincide with a DMA transfer or another bus master using the same shared memory bus, it can experience variable stalls — again, a hardware-level source of jitter that's largely invisible to the scheduling algorithm itself but very real in its effect on measured timing.
+
+5. **Time-slice and Round-Robin rotation timing** (connecting back to Section 3) — if a task's execution happens to coincide with different points in an ongoing Round Robin rotation among equal-priority tasks on different cycles, its effective wait time before running can vary — a direct, scheduling-policy-induced source of jitter.
+
+---
+
+**Corner case: Jitter is measured differently depending on what you're actually measuring**
+
+A pro-level distinction worth being precise about — there isn't just "one" jitter, there are (at least) two commonly discussed:
+
+- **Release Jitter (or Scheduling Jitter)** — variation in *when a task starts* relative to when it should have started.
+- **Completion Jitter (or Output Jitter)** — variation in *when a task finishes* or produces its output, which combines release jitter **plus** any variation in the task's own execution time (e.g., a control loop task that sometimes takes 2ms and sometimes 3ms to compute, due to different code paths being taken based on input data).
+
+**Why this distinction matters practically:** A system might have excellent (near-zero) release jitter — the task always starts almost exactly on time — but still suffer from poor **completion** jitter if the task's own internal execution time varies significantly based on the data it's processing. Fixing release jitter (tightening interrupt latency, reducing critical section hold times) does nothing to fix completion jitter caused by the task's own variable internal logic — these require genuinely different engineering interventions, and conflating them is a real, common analysis mistake.
+
+---
+
+**How jitter is actually measured and bounded in real engineering practice**
+
+Pro-level real-time engineers don't just theorize about jitter — they **measure it directly**, using tools mentioned earlier in the syllabus (Section 16: trace tools like SEGGER SystemView, Percepio Tracealyzer) that timestamp every interrupt, context switch, and task transition at high resolution, over a long enough observation window to capture rare worst-case events (a jitter spike that occurs once in 10,000 cycles is invisible in a short test run but could still violate a hard real-time requirement in a system that runs continuously for years). This is a genuine corner case worth internalizing: **jitter analysis fundamentally requires statistical, long-duration observation, not a handful of manual test runs** — rare, tail-end jitter events are often the ones that actually matter most for certification and safety-critical validation, precisely because they're the hardest to catch through casual testing.
+
+---
+
+**Pro-level summary in one paragraph**
+
+Scheduling Latency is the full, decomposable delay between an event occurring and a task actually executing — the sum of hardware interrupt latency, worst-case interrupt-disable time, ISR execution time, scheduler decision time, and context switch time — and only the **worst-case**, not the average, matters for a genuine hard real-time guarantee. Jitter is the **variation** in that latency (or in task completion timing) across repeated cycles, and it's often more damaging to precision-dependent systems (like control loops) than raw latency itself, because unpredictable variation cannot be compensated for the way a fixed, known delay can. Its root causes span the entire stack you've learned so far — variable critical-section durations, cache effects, priority inversion, bus contention, and Round Robin rotation timing — and properly bounding it requires long-duration, statistical measurement using real tracing tools, not short manual tests, because the rare worst-case jitter spike is usually exactly the one that matters most.
+
+---
 
